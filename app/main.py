@@ -7,6 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .branches import select_branch
 from .calibrate import calibrate_runs
 from .compiler import CompileError, compile_commands, preview_change
 from .fillers import plan_fillers
@@ -16,6 +17,8 @@ from .rebalance import rebalance_schedule
 from .reconcile import reconcile_runs
 from .routing import assign_routing
 from .schemas import (
+    BranchSelectRequest,
+    BranchSelectResponse,
     CalibrateRequest,
     CalibrateResponse,
     CommandItem,
@@ -39,7 +42,7 @@ from .schemas import (
 
 app = FastAPI(
     title="直播导播口令编排 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "接收导播口令数组，解析锚点依赖得到每条口令的起止毫秒时间，"
         "并列出同通道半开区间重叠的冲突 id 对；"
@@ -53,7 +56,9 @@ app = FastAPI(
         "还可对 base / left / right 三份口令版本按 id 和字段做无状态三方合并；"
         "亦可在给定起点窗口内规划临时插播，求撤销口令最少、并列起点最早的方案；"
         "还可在目标通道视界内的空档中联合分配填充素材，"
-        "求填充总时长最大、并列优先级最高、再并列 id 序列字典序最小的排布。"
+        "求填充总时长最大、并列优先级最高、再并列 id 序列字典序最小的排布；"
+        "亦可在至多 8 个布尔开关的组合空间中选择启用的口令子集，"
+        "求翻转开关数最少、并列取值序列字典序最小的安全组合。"
     ),
 )
 
@@ -221,4 +226,20 @@ async def interruption_plan(body: InterruptionPlanRequest) -> dict:
         earliest_start_ms=body.earliest_start_ms,
         latest_start_ms=body.latest_start_ms,
         cancellable_ids=list(body.cancellable_ids),
+    )
+
+
+@app.post(
+    "/branches/select",
+    response_model=BranchSelectResponse,
+    tags=["branches"],
+    summary="分支选择：枚举开关组合，求翻转最少且无冲突的口令启用方案",
+    responses={422: {"model": ErrorBody, "description": "请求非法或无安全组合"}},
+)
+async def branch_select(body: BranchSelectRequest) -> dict:
+    # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用
+    return select_branch(
+        [item.model_dump() for item in body.commands],
+        [item.model_dump() for item in body.switches],
+        [item.model_dump() for item in body.conditions],
     )

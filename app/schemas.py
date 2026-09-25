@@ -520,6 +520,66 @@ MergeResponse = Annotated[
 ]
 
 
+class SwitchItem(BaseModel):
+    """单个布尔开关：名称与当前取值。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="开关名；不能为空，各开关之间不可重复")
+    current: bool = Field(..., description="开关当前取值；翻转数相对它计算")
+
+
+class BranchCondition(BaseModel):
+    """一条口令的启用条件：按口令 id 给出的开关取值要求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="口令 id（必须存在于 commands 中，不能为空）")
+    requires: dict[str, bool] = Field(
+        ...,
+        description=(
+            "开关名 -> 要求取值；全部成立时该口令才启用，空对象等价于未设置条件"
+        ),
+    )
+
+
+class BranchSelectRequest(BaseModel):
+    """POST /branches/select 请求体：/compile 同格式口令数组 + 有序开关 + 按 id 的启用条件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="现有口令数组，格式与 POST /compile 的请求体一致"
+    )
+    switches: list[SwitchItem] = Field(
+        ...,
+        description=(
+            "有序布尔开关列表（名称互异），至多 8 个；"
+            "组合枚举、翻转数与字典序裁决均按输入顺序"
+        ),
+        max_length=8,
+    )
+    conditions: list[BranchCondition] = Field(
+        ...,
+        description="按口令 id 给出的开关取值条件；未列出的口令始终启用",
+    )
+
+
+class BranchSelectResponse(BaseModel):
+    values: dict[str, bool] = Field(
+        ..., description="选中的开关取值（按 switches 输入顺序）"
+    )
+    flipped: list[str] = Field(
+        ..., description="相对当前取值被翻转的开关名，按 switches 输入顺序"
+    )
+    timeline: list[TimelineEntry] = Field(
+        ...,
+        description=(
+            "选中取值下最终启用口令的时间线，结构与排序与 /compile 一致"
+        ),
+    )
+
+
 class ErrorBody(BaseModel):
     code: Literal[
         "INVALID_REQUEST",
@@ -547,6 +607,12 @@ class ErrorBody(BaseModel):
         "INVALID_PRIORITY",
         "TOO_MANY_FILLERS",
         "TOO_MANY_GAPS",
+        "INVALID_SWITCH",
+        "DUPLICATE_SWITCH",
+        "TOO_MANY_SWITCHES",
+        "CONDITION_TARGET_NOT_FOUND",
+        "UNKNOWN_SWITCH",
+        "NO_SAFE_COMBINATION",
     ]
     message: str
     details: dict | None = None
