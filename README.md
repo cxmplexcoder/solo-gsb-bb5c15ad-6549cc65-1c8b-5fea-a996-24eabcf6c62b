@@ -12,7 +12,9 @@ base / left / right 三份口令版本按 id 和字段做无状态三方合并�
 复用编排器校验合并结果；还可在给定起点窗口内为指定通道规划一条临时插播，
 求需要撤销的现有口令最少、并列时起点最早的插播方案；还可在目标通道
 `[0, horizon_end_ms)` 的空档内联合分配至多 12 条填充素材，求填充总时长最大、
-并列时优先级总和最大、再并列时素材 id 序列字典序最小的排布。
+并列时优先级总和最大、再并列时素材 id 序列字典序最小的排布；亦可枚举至多
+8 个布尔开关的全部组合，按口令条件筛选启用口令，选相对当前取值翻转开关最少、
+且无悬空锚点与同通道冲突的安全分支。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
@@ -25,6 +27,7 @@ base / left / right 三份口令版本按 id 和字段做无状态三方合并�
 - 口令三方合并接口：`POST /versions/merge`
 - 临时插播规划接口：`POST /interruptions/plan`
 - 空档填充规划接口：`POST /fillers/plan`
+- 分支选择接口：`POST /branches/select`
 
 ## 一条命令启动
 
@@ -1211,6 +1214,201 @@ curl -s http://localhost:8000/fillers/plan \
 }
 ```
 
+## 接口约定：`POST /branches/select`
+
+面对一套「布尔开关 → 口令是否上场」的导播编排（例如两路备播内容各由一个开关
+控制是否启用），本接口枚举全部开关组合，帮导播找出**相对当前取值改动最小**、
+且编排仍然合法的安全分支。现有口令先复用 `POST /compile` 的编排器解析起止时刻
+与同通道冲突。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 现有口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `switches` | array | 是 | 布尔开关列表，**至多 8 个**，可为空数组；名称互异，顺序即并列裁决顺序 |
+| `conditions` | array | 否 | 按口令 id 给出的开关取值条件，缺省为空数组（全部口令始终启用） |
+
+`switches` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `name` | string | 是 | 开关名；不能为空，各开关之间不可重复 |
+| `current` | boolean | 是 | 开关当前取值；翻转数与并列裁决均以此为基准 |
+
+`conditions` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 口令 id，必须存在于 `commands` 中且不能为空；同一 id 只能声明一次 |
+| `requires` | object&lt;string, boolean&gt; | 是 | 开关取值条件：键为开关名（必须已定义），值为要求的取值；全部满足时该口令才启用；空映射等价于无条件 |
+
+组合筛选与选择规则：
+
+- **未设置条件的口令始终启用**；设置了条件的口令仅当 `requires` 中每个开关
+  的取值都等于要求值时才启用。
+- 枚举全部 `2^k` 个开关组合（`k ≤ 8`，至多 256 个），只保留满足下列两条的
+  **安全组合**：
+  - 每条启用口令的锚点（`START` 除外）也必须启用——启用口令引用了未启用
+    锚点（悬空锚点）时该组合无效；
+  - 启用口令之间不存在同通道半开区间重叠冲突（首尾相接不算，不同通道互不影响）。
+- 在全部安全组合中，先取相对开关**当前取值翻转开关数最少**者；翻转数并列时，
+  取「按开关输入顺序、`false` 小于 `true`」的布尔取值序列字典序最小者。
+- 选中组合的最终时间线复用编排器对启用口令重新解析，结构与排序与 `/compile`
+  完全一致（按 `(start_ms, id)` 升序）。请求无状态、不落数据。
+
+响应字段：
+
+- `selected`：选中的开关取值，按开关输入顺序；每项含 `name`、`value`。
+- `flipped`：相对 `current` 发生翻转的开关名，按开关输入顺序。
+- `timeline`：选中组合下启用口令的最终时间线，结构与 `/compile` 一致。
+
+### 请求示例（当前组合即最优，零翻转）
+
+`main_a` 与 `main_b` 都锚定 `open`，在 `main` 通道完全重叠；`tail` 在 `sub`
+通道锚定 `main_a`。开关当前为 `use_a=true`、`use_b=false`：启用
+`{open, main_a, tail}`，无冲突且锚点完整；`use_b=true` 会同时启用 `main_a`
+与 `main_b` 造成冲突，因此当前组合本身就是 0 翻转的最优解：
+
+```bash
+curl -s http://localhost:8000/branches/select \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "open", "channel": "main", "anchor": "START",  "offset_ms": 0, "duration_ms": 600},
+      {"id": "main_a", "channel": "main", "anchor": "open",  "offset_ms": 0, "duration_ms": 900},
+      {"id": "main_b", "channel": "main", "anchor": "open",  "offset_ms": 0, "duration_ms": 900},
+      {"id": "tail", "channel": "sub",  "anchor": "main_a", "offset_ms": 0, "duration_ms": 300}
+    ],
+    "switches": [
+      {"name": "use_a", "current": true},
+      {"name": "use_b", "current": false}
+    ],
+    "conditions": [
+      {"id": "main_a", "requires": {"use_a": true}},
+      {"id": "main_b", "requires": {"use_b": true}},
+      {"id": "tail",   "requires": {"use_a": true}}
+    ]
+  }'
+```
+
+响应示例（`200`）：
+
+```json
+{
+  "selected": [
+    {"name": "use_a", "value": true},
+    {"name": "use_b", "value": false}
+  ],
+  "flipped": [],
+  "timeline": [
+    {"id": "open", "channel": "main", "anchor": "START",  "offset_ms": 0, "duration_ms": 600, "start_ms": 0,    "end_ms": 600},
+    {"id": "main_a", "channel": "main", "anchor": "open",  "offset_ms": 0, "duration_ms": 900, "start_ms": 600,  "end_ms": 1500},
+    {"id": "tail", "channel": "sub",  "anchor": "main_a", "offset_ms": 0, "duration_ms": 300, "start_ms": 1500, "end_ms": 1800}
+  ]
+}
+```
+
+### 请求示例（并列裁决：按输入顺序 false 小于 true）
+
+`x`、`y` 均锚定 `base`，在 `main` 通道 `[500, 900)` 重叠。当前开关为
+`s1=true`、`s2=true`，同时启用 `x`、`y` 的组合因冲突无效；只需翻转 1 个开关
+的安全组合有 `(false, true)`（启用 `y`）与 `(true, false)`（启用 `x`）两个，
+按输入顺序、`false < true` 取 `(false, true)`：
+
+```bash
+curl -s http://localhost:8000/branches/select \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "base", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 500},
+      {"id": "x", "channel": "main", "anchor": "base",  "offset_ms": 0, "duration_ms": 400},
+      {"id": "y", "channel": "main", "anchor": "base",  "offset_ms": 0, "duration_ms": 400}
+    ],
+    "switches": [
+      {"name": "s1", "current": true},
+      {"name": "s2", "current": true}
+    ],
+    "conditions": [
+      {"id": "x", "requires": {"s1": true}},
+      {"id": "y", "requires": {"s2": true}}
+    ]
+  }'
+```
+
+响应示例（`200`）：翻转的开关只有 `s1`，最终时间线为 `base` 与 `y`：
+
+```json
+{
+  "selected": [
+    {"name": "s1", "value": false},
+    {"name": "s2", "value": true}
+  ],
+  "flipped": ["s1"],
+  "timeline": [
+    {"id": "base", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 500, "start_ms": 0,   "end_ms": 500},
+    {"id": "y", "channel": "main", "anchor": "base",  "offset_ms": 0, "duration_ms": 400, "start_ms": 500, "end_ms": 900}
+  ]
+}
+```
+
+### 请求示例（无安全组合，422）
+
+`c` 无条件启用、与 `a` 在 `main` 通道 `[0, 1000)` 完全重叠；`b` 无条件锚定
+`a`。开关 `p=false` 时 `a` 被条件关闭，但启用的 `b` 引用了未启用锚点（悬空）；
+`p=true` 时 `a` 与 `c` 冲突——两种组合都不是安全组合：
+
+```bash
+curl -s http://localhost:8000/branches/select \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "c", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "sub",  "anchor": "a",     "offset_ms": 0, "duration_ms": 500}
+    ],
+    "switches": [{"name": "p", "current": false}],
+    "conditions": [
+      {"id": "a", "requires": {"p": true}}
+    ]
+  }'
+```
+
+响应（`422`）：
+
+```json
+{
+  "code": "NO_FEASIBLE_BRANCH",
+  "message": "不存在任何安全开关组合：所有组合都存在悬空锚点或同通道冲突",
+  "details": {
+    "switch_count": 1,
+    "combination_count": 2
+  }
+}
+```
+
+### 请求示例（未知开关或未知口令 id，422）
+
+条件 `requires` 引用未定义的开关名时返回 `422` + `UNKNOWN_SWITCH`
+（`details.names` 按字典序列出未知开关名）；条件 `id` 不存在于 `commands`
+时返回 `422` + `BRANCH_TARGET_NOT_FOUND`（`details.ids` 按 id 升序）：
+
+```json
+{
+  "code": "UNKNOWN_SWITCH",
+  "message": "条件引用了未定义的开关: ghost",
+  "details": { "names": ["ghost"] }
+}
+```
+
+```json
+{
+  "code": "BRANCH_TARGET_NOT_FOUND",
+  "message": "条件引用了不存在的口令 id: ghost",
+  "details": { "ids": ["ghost"] }
+}
+```
+
 ## 错误处理
 
 所有业务错误均返回 HTTP `422`，响应体统一为：
@@ -1252,6 +1450,12 @@ curl -s http://localhost:8000/fillers/plan \
 | `INVALID_PRIORITY` | 仅 `POST /fillers/plan`：素材 `priority` 为负数 |
 | `TOO_MANY_FILLERS` | 仅直接调用核心逻辑时：素材超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
 | `TOO_MANY_GAPS` | 仅 `POST /fillers/plan`：目标通道在 `[0, horizon_end_ms)` 内的空档超过 8 个，`details.count` / `details.limit` 给出实际数与上限 |
+| `INVALID_SWITCH` | 仅 `POST /branches/select`：开关名为空 |
+| `DUPLICATE_SWITCH` | 仅 `POST /branches/select`：开关重名，`details.names` 给出重名开关 |
+| `TOO_MANY_SWITCHES` | 仅直接调用核心逻辑时：开关超过 8 个（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
+| `UNKNOWN_SWITCH` | 仅 `POST /branches/select`：条件 `requires` 引用了未定义的开关名 |
+| `BRANCH_TARGET_NOT_FOUND` | 仅 `POST /branches/select`：条件 `id` 引用了不存在于 `commands` 的口令 id |
+| `NO_FEASIBLE_BRANCH` | 仅 `POST /branches/select`：不存在任何安全组合（所有组合都有悬空锚点或同通道冲突），`details.switch_count` / `details.combination_count` 给出开关数与枚举组合数 |
 
 > `POST /versions/merge` 的字段级分歧不是错误：无论是否合并成功都返回 HTTP `200`，
 > 由响应体的 `status`（`merged` / `diverged`）区分；仅版本内部重复 id
@@ -1361,6 +1565,28 @@ curl -s http://localhost:8000/fillers/plan \
   第三目标的 id 序列字典序经整数编码参与比较，不逐方案枚举。
 - 请求无状态、不落数据；服务端不会修改 `commands` 与 `fillers`。
 
+`POST /branches/select` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、
+  依赖环、负起点等），且全量编排非法时优先返回编排错误码；全量口令之间允许
+  存在冲突——只要没有任何安全组合同时启用冲突两端即可。
+- 开关名为空返回 `INVALID_SWITCH`；开关重名返回 `DUPLICATE_SWITCH`；
+  条件 id 为空返回 `INVALID_ID`；同一口令 id 的条件重复声明返回
+  `DUPLICATE_ID`。
+- 条件 `requires` 引用未定义开关名返回 `UNKNOWN_SWITCH`
+  （`details.names` 为全部未知开关名，按字典序）；条件 id 不存在于
+  `commands` 返回 `BRANCH_TARGET_NOT_FOUND`（`details.ids` 为未知 id，
+  按 id 升序）；两类问题同时存在时先报 `UNKNOWN_SWITCH`。
+- 开关超过 8 个、`current` 不是布尔值、字段缺失 / 类型错误 / 多余字段等
+  结构问题返回 `INVALID_REQUEST`（直接调用核心逻辑时开关超限返回
+  `TOO_MANY_SWITCHES`）；`switches` 允许为空数组，此时只评估唯一组合。
+- 悬空锚点与冲突只使对应组合无效，**不是请求错误**；只有全部 `2^k` 个组合
+  都无效时才返回 `NO_FEASIBLE_BRANCH`。
+- 并列裁决严格按开关输入顺序逐位比较布尔值（`false < true`），与开关名的
+  字典序无关；`flipped` 与 `selected` 均按开关输入顺序返回。
+- 请求无状态、不落数据；服务端不会修改 `commands`、`switches` 与
+  `conditions`；最终时间线是编排器对启用口令的重新解析结果。
+
 ## 本地开发（不使用 Docker）
 
 要求 Python 3.11+：
@@ -1375,6 +1601,7 @@ uvicorn app.main:app --reload --port 8000
 通道改派逻辑位于 `app/routing.py`，
 口令三方合并逻辑位于 `app/merge.py`，临时插播规划逻辑位于
 `app/interruptions.py`，空档填充规划逻辑位于 `app/fillers.py`，
+分支选择逻辑位于 `app/branches.py`，
 均仅使用标准库，可直接运行单元测试：
 
 ```bash
@@ -1387,6 +1614,7 @@ python3 -m unittest discover -s tests
 .
 ├── app/
 │   ├── __init__.py
+│   ├── branches.py         # 纯标准库的分支选择（开关组合枚举 + 最少翻转 + 悬空锚点/冲突过滤）
 │   ├── calibrate.py       # 纯标准库的时钟校准（候选偏移区间扫描 + 一致数最多裁决）
 │   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
 │   ├── fillers.py         # 纯标准库的空档填充规划（空档并集 + 子集 DP 联合分配）
@@ -1396,8 +1624,9 @@ python3 -m unittest discover -s tests
 │   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
 │   ├── routing.py         # 纯标准库的通道改派（位掩码分支限界：最少改派 + 字典序裁决）
 │   ├── schemas.py         # Pydantic 请求与响应模型
-│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/runs/calibrate、/routing/assign、/versions/merge、/interruptions/plan、/fillers/plan、/health、统一错误处理）
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/runs/calibrate、/routing/assign、/versions/merge、/interruptions/plan、/fillers/plan、/branches/select、/health、统一错误处理）
 ├── tests/
+│   ├── test_branches.py     # 分支选择核心逻辑单元测试（含暴力枚举对照 fuzz）
 │   ├── test_calibrate.py      # 时钟校准核心逻辑单元测试（标准库 unittest）
 │   ├── test_compiler.py       # 编排核心逻辑单元测试（标准库 unittest）
 │   ├── test_fillers.py        # 空档填充规划核心逻辑单元测试（含暴力枚举对照 fuzz）

@@ -448,6 +448,72 @@ class FillerPlanResponse(BaseModel):
     )
 
 
+class SwitchItem(BaseModel):
+    """单个布尔开关：名称互异，携带当前取值；顺序即并列裁决时的比较顺序。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="开关名；不能为空，各开关之间不可重复")
+    current: bool = Field(..., description="开关当前取值")
+
+
+class BranchCondition(BaseModel):
+    """一条口令的启用条件：requires 中的开关取给定值时该口令才启用。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="口令 id（必须存在于 commands 中，不能为空）")
+    requires: dict[str, bool] = Field(
+        ...,
+        description=(
+            "开关取值条件：键为开关名（必须已定义），值为要求的取值；"
+            "全部满足时该口令才启用，未设置条件的口令始终启用"
+        ),
+    )
+
+
+class BranchSelectRequest(BaseModel):
+    """POST /branches/select 请求体：/compile 同格式口令数组 + 开关 + 按 id 的条件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="现有口令数组，格式与 POST /compile 的请求体一致"
+    )
+    switches: list[SwitchItem] = Field(
+        ...,
+        description=(
+            "至多 8 个名称互异的布尔开关，按输入顺序排列；"
+            "并列裁决时按该顺序比较，false 小于 true"
+        ),
+        max_length=8,
+    )
+    conditions: list[BranchCondition] = Field(
+        default_factory=list,
+        description="按口令 id 给出的开关取值条件；未设置条件的口令始终启用",
+    )
+
+
+class BranchSwitchValue(BaseModel):
+    name: str = Field(..., description="开关名，按输入顺序")
+    value: bool = Field(..., description="选中组合中该开关的取值")
+
+
+class BranchSelectResponse(BaseModel):
+    selected: list[BranchSwitchValue] = Field(
+        ..., description="选中的开关取值，按开关输入顺序"
+    )
+    flipped: list[str] = Field(
+        ..., description="相对当前取值发生翻转的开关名，按开关输入顺序"
+    )
+    timeline: list[TimelineEntry] = Field(
+        ...,
+        description=(
+            "选中组合下启用口令的最终时间线，结构与排序与 /compile 一致"
+        ),
+    )
+
+
 class MergeRequest(BaseModel):
     """POST /versions/merge 请求体：base / left / right 三份 /compile 同格式口令数组。"""
 
@@ -547,6 +613,12 @@ class ErrorBody(BaseModel):
         "INVALID_PRIORITY",
         "TOO_MANY_FILLERS",
         "TOO_MANY_GAPS",
+        "INVALID_SWITCH",
+        "DUPLICATE_SWITCH",
+        "TOO_MANY_SWITCHES",
+        "UNKNOWN_SWITCH",
+        "BRANCH_TARGET_NOT_FOUND",
+        "NO_FEASIBLE_BRANCH",
     ]
     message: str
     details: dict | None = None
